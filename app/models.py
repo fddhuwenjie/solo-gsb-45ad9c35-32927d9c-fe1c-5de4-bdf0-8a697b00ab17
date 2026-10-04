@@ -2170,10 +2170,11 @@ class ExecutionVerificationResult(BaseModel):
     execution_id: str
     verified_version: int = Field(
         ...,
-        description="Number of committed versions confirmed consistent "
-                    "(version 0 included): the last fully verified version is "
-                    "verified_version - 1. On a fully verified prefix this "
-                    "equals the package version.",
+        description="The last fully verified version: only versions whose "
+                    "replay passed completely are counted, so a failure at "
+                    "version v reports v-1 (0 when the initial entry itself "
+                    "fails). On a fully verified package this equals the "
+                    "package version.",
     )
     version: int = Field(..., description="Version the package itself declares.")
     stage_count: int

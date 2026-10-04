@@ -1085,14 +1085,16 @@ curl -s -X POST http://another-instance:8080/execution-verifications \
   --data @execution-export.json
 ```
 
-核验方只用包内的场景与计划，从版本 0 起自行重建状态并**逐阶段**独立回放，依次
-核对：提交序列完整唯一连续（无缺失/重复/乱序/越界版本）、版本与阶段头一致、
-动作集合与原计划该阶段**完全一致**（**空阶段同样核对**）、阶段可安全回放
-（`allowed_stages`、同阶段增撤矛盾、阶段后每条通信关系仍有有效信任路径）、每条
-现场信任锚/端点链观测都与确定性推出的阶段后状态一致，以及包内快照与核验方独立
-重建的快照逐项一致（动作、观测、完整信任锚集合、完整端点链集合与**全部**通信
-关系）。发现缺失、重复、乱序或任何内容不符时，返回
-`"status": "conflict"` 并给出**首个**出错阶段（`mismatch.stage` /
+核验方只用包内的场景与计划，从版本 0 起自行重建状态并**逐阶段**独立回放，
+**按提交顺序逐条核对**：每条提交先核对其序列位置（提交序列完整唯一连续，
+无缺失/重复/乱序/越界版本），再依次核对版本与阶段头一致、动作集合与原计划
+该阶段**完全一致**（**空阶段同样核对**）、阶段可安全回放（`allowed_stages`、
+同阶段增撤矛盾、阶段后每条通信关系仍有有效信任路径）、每条现场信任锚/端点链
+观测都与确定性推出的阶段后状态一致，以及包内快照与核验方独立重建的快照逐项
+一致（动作、观测、完整信任锚集合、完整端点链集合与**全部**通信关系）；一条
+提交全部通过后才会查看下一条，因此较早提交的动作、观测或快照未通过核验时，
+后续提交的缺失、重复或乱序不会抢先报告。发现缺失、重复、乱序或任何内容不符
+时，返回 `"status": "conflict"` 并给出**首个**出错阶段（`mismatch.stage` /
 `mismatch.version`）与机器可读 `reason`（如 `commit_gap`、
 `commit_duplicate_version`、`stage_out_of_order`、`commit_extra`、
 `header_mismatch`、`version_stage_mismatch`、`initial_entry_not_empty`、
@@ -1100,8 +1102,8 @@ curl -s -X POST http://another-instance:8080/execution-verifications \
 `observation_mismatch`、`snapshot_mismatch`、`invalid_scenario` /
 `invalid_plan`，或信任回放码 `untrusted_root` / `issuer_mismatch` /
 `action_not_allowed_at_stage` / `contradictory_actions_same_stage`），
-**不依据错误快照继续回放**（`verified_version` 为已确认版本数，之后的版本不再
-核验）。
+**不依据错误快照继续回放**（`verified_version` 只计入已完整核验的版本——
+首个未通过的版本自身不计入，其后的版本也不再核验）。
 
 计划**尚未执行完**时，核验通过也会明确返回「已核对到哪个版本、下一阶段是
 几」。以上面只提交了阶段 1 的包为例：
@@ -1127,9 +1129,9 @@ curl -s -X POST http://another-instance:8080/execution-verifications \
 ```json
 {
   "status": "conflict",
-  "verified_version": 1,
+  "verified_version": 0,
   "version": 1,
-  "next_stage": 2,
+  "next_stage": 1,
   "finished": false,
   "mismatch": {
     "version": 1,
@@ -1144,6 +1146,10 @@ curl -s -X POST http://another-instance:8080/execution-verifications \
   "scope": "package-internal consistency only: ..."
 }
 ```
+
+版本 1 的提交未通过核验：`verified_version` 只计入已完整核验的版本 0，
+`next_stage` 相应回到 1，而 `mismatch.version` / `mismatch.stage` 仍定位
+首个出错的版本与阶段。
 
 > 核验结论**只说明包内一致性**（提交前缀在登记场景与原计划下确实确定性地回放为
 > 包内的观测与快照），**不冒充来源真实性或对端身份证明**——导出方身份与传输

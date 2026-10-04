@@ -741,17 +741,21 @@ def verify_plan_execution_export(req: ExecutionExport) -> Any:
 
     The verifier needs no access to the originating SQLite file: it parses the
     package's own scenario/plan and replays the committed prefix from scratch
-    version by version. For each version it checks the commit sequence
-    (missing/duplicate/out-of-order/extra entries), the stage header, the exact
-    planned action set (empty no-op stages included), a safe deterministic
-    replay (allowed_stages, add/remove contradictions and every required
-    client→endpoint trust path), every submitted trust-anchor/endpoint-chain
-    observation, and the full stored snapshot (trust anchors, endpoint chains
-    and all communication relationships).
+    version by version. Entries are checked strictly in commit order — each
+    entry's sequence position (missing/duplicate/out-of-order/extra) and then
+    its full content: the stage header, the exact planned action set (empty
+    no-op stages included), a safe deterministic replay (allowed_stages,
+    add/remove contradictions and every required client→endpoint trust path),
+    every submitted trust-anchor/endpoint-chain observation, and the full
+    stored snapshot (trust anchors, endpoint chains and all communication
+    relationships). One entry is fully replayed before the next is examined,
+    so an earlier entry's content failure is always reported ahead of a later
+    entry's sequence defect.
 
     The first inconsistent version ends verification with
     ``status: "conflict"`` naming that version's stage and a machine-readable
-    ``reason``; replay never continues from a faulty snapshot. When the plan is
+    ``reason``; replay never continues from a faulty snapshot and
+    ``verified_version`` counts only fully verified versions. When the plan is
     not fully executed yet the response states the verified version and the
     next stage. A verdict attests package-internal consistency only — it does
     not authenticate the exporter or prove origin.

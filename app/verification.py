@@ -6,10 +6,11 @@ package's own scenario and plan are parsed and structurally validated, then
 every committed version (starting with version 0) is replayed from scratch with
 the same deterministic engine used at commit time.
 
-For each version the verifier checks, in order:
+Entries are verified strictly in commit order, one at a time; for each
+entry the verifier checks, in order:
 
-* the commit sequence is complete, unique and consecutive (no missing,
-  duplicate, out-of-order or trailing-extra versions);
+* its sequence position: versions must be complete, unique and consecutive
+  (no missing, duplicate, out-of-order or trailing-extra entries);
 * the stage header is consistent with the version and with the plan;
 * the committed action set equals exactly what the immutable plan schedules
   there (empty for a no-op stage — empty stages are verified like any other);
@@ -21,8 +22,12 @@ For each version the verifier checks, in order:
   for that state — actions, observations, complete trust-anchor set, complete
   endpoint-chain set and every relationship.
 
-The first failing version ends verification: the reported ``verified_version``
-is the number of confirmed-good versions and replay is **never** continued from
+Because each entry is fully replayed before the next one is even examined,
+a content failure at an earlier version is always reported ahead of a later
+entry's missing/duplicate/out-of-order defect. The first failing version
+ends verification: the reported ``verified_version`` counts only fully
+verified versions (the failing version itself is never counted, so a
+failure at version v reports v-1) and replay is **never** continued from
 a faulty snapshot.
 
 Scope: this establishes package-internal consistency only. It does not
@@ -242,7 +247,7 @@ def _compare_snapshot(
 
 
 def _validate_observation_refs(
-    pkg: ExecutionExport, sc: Scenario, entry
+    pkg: ExecutionExport, sc: Scenario, entry, *, verified_before: int
 ) -> Optional[ExecutionVerificationResult]:
     clients = _known_clients(sc)
     seen_anchors: set[tuple[str, str]] = set()
@@ -251,7 +256,7 @@ def _validate_observation_refs(
         if key in seen_anchors:
             return _fail(
                 pkg,
-                verified_version=entry.version,
+                verified_version=verified_before,
                 version=entry.version,
                 stage=entry.stage,
                 reason="duplicate_observation",
@@ -265,11 +270,13 @@ def _validate_observation_refs(
         seen_anchors.add(key)
         if obs.client_id not in clients:
             return _unknown_ref(
-                pkg, entry, kind="anchor", ref="client_id", value=obs.client_id
+                pkg, entry, verified_before=verified_before,
+                kind="anchor", ref="client_id", value=obs.client_id,
             )
         if obs.anchor_cert_id not in sc.certs:
             return _unknown_ref(
-                pkg, entry, kind="anchor", ref="anchor_cert_id",
+                pkg, entry, verified_before=verified_before,
+                kind="anchor", ref="anchor_cert_id",
                 value=obs.anchor_cert_id,
             )
     seen_endpoints: set[str] = set()
@@ -277,7 +284,7 @@ def _validate_observation_refs(
         if obs.endpoint_id in seen_endpoints:
             return _fail(
                 pkg,
-                verified_version=entry.version,
+                verified_version=verified_before,
                 version=entry.version,
                 stage=entry.stage,
                 reason="duplicate_observation",
@@ -291,22 +298,25 @@ def _validate_observation_refs(
         seen_endpoints.add(obs.endpoint_id)
         if obs.endpoint_id not in sc.endpoint_chains:
             return _unknown_ref(
-                pkg, entry, kind="endpoint_chain", ref="endpoint_id",
+                pkg, entry, verified_before=verified_before,
+                kind="endpoint_chain", ref="endpoint_id",
                 value=obs.endpoint_id,
             )
         for cid in obs.chain:
             if cid not in sc.certs:
                 return _unknown_ref(
-                    pkg, entry, kind="endpoint_chain", ref="chain", value=cid,
+                    pkg, entry, verified_before=verified_before,
+                    kind="endpoint_chain", ref="chain", value=cid,
                     detail={"endpoint_id": obs.endpoint_id},
                 )
     return None
 
 
-def _unknown_ref(pkg, entry, *, kind: str, ref: str, value: str, detail=None):
+def _unknown_ref(pkg, entry, *, verified_before: int, kind: str, ref: str,
+                 value: str, detail=None):
     return _fail(
         pkg,
-        verified_version=entry.version,
+        verified_version=verified_before,
         version=entry.version,
         stage=entry.stage,
         reason="unknown_reference",
@@ -366,7 +376,7 @@ def verify_export(pkg: ExecutionExport) -> ExecutionVerificationResult:
             found=pkg.stage_count,
         )
 
-    # ---- commit sequence must be exactly versions 0..version ---------------
+    # ---- the package must start with the version-0 initial entry -----------
     if not pkg.commits or pkg.commits[0].version != 0:
         return _fail(
             pkg,
@@ -380,74 +390,6 @@ def verify_export(pkg: ExecutionExport) -> ExecutionVerificationResult:
             ),
             expected=0,
             found=pkg.commits[0].version if pkg.commits else None,
-        )
-
-    seen_versions: set[int] = set()
-    for pos, entry in enumerate(pkg.commits):
-        expect_v = pos
-        if entry.version in seen_versions:
-            return _fail(
-                pkg,
-                verified_version=pos,
-                version=entry.version,
-                stage=entry.stage,
-                reason="commit_duplicate_version",
-                message=f"version {entry.version} appears more than once.",
-                expected=None,
-                found=entry.version,
-            )
-        seen_versions.add(entry.version)
-        if entry.version != expect_v:
-            # Covers both gaps (a missing version leaves a hole) and
-            # out-of-order entries (version smaller than its position).
-            reason = (
-                "commit_gap"
-                if entry.version > expect_v
-                else "stage_out_of_order"
-            )
-            return _fail(
-                pkg,
-                verified_version=expect_v,
-                version=entry.version,
-                stage=entry.stage,
-                reason=reason,
-                message=(
-                    f"commits must be consecutive from 0; expected version "
-                    f"{expect_v} at position {pos}, found {entry.version}."
-                ),
-                expected=expect_v,
-                found=entry.version,
-            )
-        if entry.version > pkg.version:
-            return _fail(
-                pkg,
-                verified_version=pkg.version,
-                version=entry.version,
-                stage=entry.stage,
-                reason="commit_extra",
-                message=(
-                    f"entry at version {entry.version} is newer than the "
-                    f"package's declared version {pkg.version}; the package "
-                    f"is not a single consistent version."
-                ),
-                expected=pkg.version,
-                found=entry.version,
-            )
-
-    # Header declared version must itself be the last committed version.
-    if pkg.commits[-1].version != pkg.version:
-        return _fail(
-            pkg,
-            verified_version=min(pkg.version, pkg.commits[-1].version),
-            version=pkg.commits[-1].version,
-            stage=pkg.commits[-1].stage,
-            reason="header_mismatch",
-            message=(
-                f"the last committed version {pkg.commits[-1].version} does "
-                f"not match the package header version {pkg.version}."
-            ),
-            expected=pkg.version,
-            found=pkg.commits[-1].version,
         )
 
     # ---- independent replay, one verified version at a time ----------------
@@ -481,19 +423,93 @@ def verify_export(pkg: ExecutionExport) -> ExecutionVerificationResult:
             trusted_anchors=failure.trusted_anchors,
         )
 
-    for entry in pkg.commits:
-        v = entry.version
+    # Entries are checked strictly in commit order: each entry's sequence
+    # position is validated and then its content is fully replayed BEFORE the
+    # next entry is even looked at. An earlier entry's content failure is
+    # therefore always reported ahead of a later entry's missing, duplicate
+    # or out-of-order defect, and the version never advances on the package
+    # header or on an unchecked commit.
+    seen_versions: set[int] = set()
+    verified = 0  # last fully verified version; nothing beyond it is trusted
+    for pos, entry in enumerate(pkg.commits):
+        expect_v = pos
+        if entry.version in seen_versions:
+            return _fail(
+                pkg,
+                verified_version=verified,
+                version=entry.version,
+                stage=entry.stage,
+                reason="commit_duplicate_version",
+                message=f"version {entry.version} appears more than once.",
+                expected=None,
+                found=entry.version,
+            )
+        seen_versions.add(entry.version)
+        if entry.version != expect_v:
+            # Covers both gaps (a missing version leaves a hole) and
+            # out-of-order entries (version smaller than its position).
+            reason = (
+                "commit_gap"
+                if entry.version > expect_v
+                else "stage_out_of_order"
+            )
+            return _fail(
+                pkg,
+                verified_version=verified,
+                version=entry.version,
+                stage=entry.stage,
+                reason=reason,
+                message=(
+                    f"commits must be consecutive from 0; expected version "
+                    f"{expect_v} at position {pos}, found {entry.version}."
+                ),
+                expected=expect_v,
+                found=entry.version,
+            )
+        if entry.version > pkg.version:
+            return _fail(
+                pkg,
+                verified_version=verified,
+                version=entry.version,
+                stage=entry.stage,
+                reason="commit_extra",
+                message=(
+                    f"entry at version {entry.version} is newer than the "
+                    f"package's declared version {pkg.version}; the package "
+                    f"is not a single consistent version."
+                ),
+                expected=pkg.version,
+                found=entry.version,
+            )
+
         bad = _verify_entry(pkg, sc, batches, state, entry)
         if bad is not None:
             return bad
         # Advance the replay state only after the version fully verified, so
         # replay never proceeds from a faulty snapshot.
-        if v >= 1:
+        verified = entry.version
+        if entry.version >= 1:
             bits = 0
             index = {aid: i for i, aid in enumerate(sc.action_ids)}
             for aid in entry.action_ids:
                 bits |= 1 << index[aid]
             state = state_for_mask_applied(sc, state, bits)
+
+    # Header declared version must itself be the last committed version.
+    if pkg.commits[-1].version != pkg.version:
+        return _fail(
+            pkg,
+            verified_version=verified,
+            version=pkg.commits[-1].version,
+            stage=pkg.commits[-1].stage,
+            reason="header_mismatch",
+            message=(
+                f"the last committed version {pkg.commits[-1].version} does "
+                f"not match the package header version {pkg.version}."
+            ),
+            expected=pkg.version,
+            found=pkg.commits[-1].version,
+        )
 
     # ---- header bookkeeping must agree with the verified prefix -----------
     expected_completed = list(range(1, pkg.version + 1))
@@ -529,7 +545,10 @@ def _verify_entry(pkg: ExecutionExport, sc: Scenario, batches, state, entry):
     """
 
     v = entry.version
-    verified_before = v  # versions 0..v-1 already confirmed
+    # Only fully verified versions count towards the reported progress: a
+    # failure at version v confirms exactly the prefix 0..v-1 (a failed
+    # initial entry confirms nothing, reported as version 0).
+    verified_before = max(0, v - 1)
 
     # version/stage header consistency on the entry itself
     if entry.stage != v:
@@ -634,7 +653,9 @@ def _verify_entry(pkg: ExecutionExport, sc: Scenario, batches, state, entry):
         )
 
     # ---- observation references must resolve in the scenario ---------------
-    ref_bad = _validate_observation_refs(pkg, sc, entry)
+    ref_bad = _validate_observation_refs(
+        pkg, sc, entry, verified_before=verified_before
+    )
     if ref_bad is not None:
         return ref_bad
 
