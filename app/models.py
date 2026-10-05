@@ -2100,7 +2100,9 @@ class VerificationMismatch(BaseModel):
     """Machine-readable location of the first failing version during replay.
 
     A verify failure never resumes replay from the faulty snapshot: the
-    reported version is the boundary up to which the package was confirmed.
+    reported version is the first version that failed, and the result's
+    ``verified_version`` is the boundary up to which the package was
+    confirmed.
     """
 
     version: int = Field(
@@ -2170,10 +2172,13 @@ class ExecutionVerificationResult(BaseModel):
     execution_id: str
     verified_version: int = Field(
         ...,
-        description="Number of committed versions confirmed consistent "
-                    "(version 0 included): the last fully verified version is "
-                    "verified_version - 1. On a fully verified prefix this "
-                    "equals the package version.",
+        description="The last fully verified committed version: versions "
+                    "0..verified_version replayed consistent. Only completely "
+                    "verified versions count — a version whose actions, "
+                    "observations or snapshot disagree is not included, and "
+                    "the package header or an unchecked commit never advances "
+                    "it. On a fully verified prefix this equals the package "
+                    "version.",
     )
     version: int = Field(..., description="Version the package itself declares.")
     stage_count: int

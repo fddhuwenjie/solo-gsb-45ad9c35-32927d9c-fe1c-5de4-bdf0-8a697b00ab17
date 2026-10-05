@@ -68,6 +68,13 @@ PLAN_WITH_EMPTY_STAGE = [
     {"stage": 2, "action_ids": ["a1-add", "a2-replace", "a3-remove"]},
 ]
 
+# Three-stage plan: one action per stage.
+PLAN_THREE_STAGES = [
+    {"stage": 1, "action_ids": ["a1-add"]},
+    {"stage": 2, "action_ids": ["a2-replace"]},
+    {"stage": 3, "action_ids": ["a3-remove"]},
+]
+
 
 def _register(plan=PLAN, scenario=SCENARIO):
     r = client.post("/plan-executions", json={**scenario, "plan": plan})
@@ -230,8 +237,9 @@ def test_missing_intermediate_entry_is_a_gap_and_reports_first_bad_version():
     assert mm["version"] == 2
     assert mm["expected"] == 1
     assert mm["found"] == 2
-    # versions strictly before the gap were confirmed
-    assert body["verified_version"] == 1
+    # only version 0 (strictly before the gap) was fully verified
+    assert body["verified_version"] == 0
+    assert body["next_stage"] == 1
     assert body["status"] == "conflict"
 
 
@@ -323,7 +331,9 @@ def test_action_set_mismatch_reports_stage_and_expected_set():
     assert mm["stage"] == 1
     assert mm["expected"] == ["a1-add"]
     assert mm["found"] == ["a3-remove"]
-    assert body["verified_version"] == 1  # v0 verified, v1 failed
+    # only fully verified versions count: v0 verified, v1 failed
+    assert body["verified_version"] == 0
+    assert body["next_stage"] == 1
 
 
 def test_observation_mismatch_anchor_present_flipped():
@@ -398,8 +408,9 @@ def test_unsafe_swapped_plan_replays_to_a_broken_relationship():
     assert mm["stage"] == 1
     assert mm["blocking_action"] == "a3-remove"
     assert mm["relationship"] == {"client_id": "c", "endpoint_id": "svc"}
-    # replay stops at stage 1; nothing later is trusted
-    assert body["verified_version"] == 1
+    # replay stops at stage 1; only version 0 is fully verified
+    assert body["verified_version"] == 0
+    assert body["next_stage"] == 1
 
 
 def test_structurally_invalid_plan_in_package_rejected():
@@ -559,7 +570,128 @@ def test_only_first_bad_version_is_reported():
     mm = body["mismatch"]
     assert mm["reason"] == "action_set_mismatch"
     assert mm["stage"] == 1
-    assert body["verified_version"] == 1
+    assert body["verified_version"] == 0
+    assert body["next_stage"] == 1
+
+
+def test_earlier_content_error_beats_later_duplicate_and_extra():
+    # Stage 1 commits the wrong action set AND the package later carries a
+    # duplicate version plus an entry newer than the header: the earlier
+    # content failure is reported, and the version never advances on
+    # unchecked commits.
+    eid = _register()
+    _commit(eid, STAGE1)
+    _commit(eid, STAGE2)
+    pkg = _export(eid)
+    pkg["commits"][1]["action_ids"] = ["a3-remove"]
+    pkg["commits"][1]["snapshot"]["action_ids"] = ["a3-remove"]
+    pkg["commits"].append(pkg["commits"][2])  # duplicate version 2
+    body = _verify(pkg)
+    mm = body["mismatch"]
+    assert mm["reason"] == "action_set_mismatch"
+    assert mm["version"] == 1
+    assert mm["stage"] == 1
+    assert body["verified_version"] == 0
+    assert body["next_stage"] == 1
+
+
+def test_earlier_snapshot_error_beats_later_gap_and_header_mismatch():
+    # Version 1's snapshot is tampered AND version 2 is dropped (a gap
+    # against the header version): the version-1 snapshot failure is
+    # reported first, not the missing entry or the header disagreement.
+    eid = _register()
+    _commit(eid, STAGE1)
+    _commit(eid, STAGE2)
+    pkg = _export(eid)
+    pkg["commits"][1]["snapshot"]["trust_anchors"] = []
+    pkg["commits"] = pkg["commits"][:2]  # header still declares version 2
+    body = _verify(pkg)
+    mm = body["mismatch"]
+    assert mm["reason"] == "snapshot_mismatch"
+    assert mm["component"] == "trust_anchors"
+    assert mm["version"] == 1
+    assert body["verified_version"] == 0
+    assert body["next_stage"] == 1
+
+
+def test_earlier_observation_error_beats_later_out_of_order():
+    # Version 1's observation is wrong AND versions 2/3 are swapped: the
+    # observation failure at version 1 is reported before the sequence
+    # problem introduced later in the package.
+    eid = _register(plan=PLAN_THREE_STAGES)
+    _commit(eid, STAGE1)
+    _commit(eid, {
+        "expected_version": 1, "stage": 2, "action_ids": ["a2-replace"],
+        "anchor_observations": [
+            {"client_id": "c", "anchor_cert_id": "root-old", "present": True},
+            {"client_id": "c", "anchor_cert_id": "root-new", "present": True},
+        ],
+        "chain_observations": [
+            {"endpoint_id": "svc", "chain": ["leaf-new", "root-new"]}],
+    })
+    _commit(eid, {
+        "expected_version": 2, "stage": 3, "action_ids": ["a3-remove"],
+        "anchor_observations": [
+            {"client_id": "c", "anchor_cert_id": "root-old", "present": False},
+            {"client_id": "c", "anchor_cert_id": "root-new", "present": True},
+        ],
+        "chain_observations": [
+            {"endpoint_id": "svc", "chain": ["leaf-new", "root-new"]}],
+    })
+    pkg = _export(eid)
+    for obs in pkg["commits"][1]["anchor_observations"]:
+        if obs["anchor_cert_id"] == "root-old":
+            obs["present"] = False
+    pkg["commits"][2], pkg["commits"][3] = pkg["commits"][3], pkg["commits"][2]
+    body = _verify(pkg)
+    mm = body["mismatch"]
+    assert mm["reason"] == "observation_mismatch"
+    assert mm["version"] == 1
+    assert body["verified_version"] == 0
+    assert body["next_stage"] == 1
+
+
+def test_initial_snapshot_error_beats_later_sequence_error():
+    # The version-0 snapshot is tampered AND version 1 is duplicated: the
+    # initial snapshot is verified in the same commit order, so its failure
+    # is reported before the duplicate entry.
+    eid = _register()
+    _commit(eid, STAGE1)
+    pkg = _export(eid)
+    pkg["commits"][0]["snapshot"]["trust_anchors"] = []
+    pkg["commits"].append(pkg["commits"][1])  # duplicate version 1
+    body = _verify(pkg)
+    mm = body["mismatch"]
+    assert mm["reason"] == "snapshot_mismatch"
+    assert mm["component"] == "trust_anchors"
+    assert mm["version"] == 0
+    assert body["verified_version"] == 0
+
+
+def test_empty_stage_content_error_beats_later_sequence_error():
+    # A no-op stage that suddenly carries an action fails its content check
+    # in commit order, before the duplicate entry appended later.
+    eid = _register(plan=PLAN_WITH_EMPTY_STAGE)
+    _commit(eid, {
+        "expected_version": 0, "stage": 1, "action_ids": [],
+        "anchor_observations": [
+            {"client_id": "c", "anchor_cert_id": "root-old", "present": True},
+            {"client_id": "c", "anchor_cert_id": "root-new", "present": False},
+        ],
+        "chain_observations": [
+            {"endpoint_id": "svc", "chain": ["leaf-old", "root-old"]}],
+    })
+    pkg = _export(eid)
+    pkg["commits"][1]["action_ids"] = ["a1-add"]  # no-op stage must be empty
+    pkg["commits"].append(pkg["commits"][1])  # duplicate version 1
+    body = _verify(pkg)
+    mm = body["mismatch"]
+    assert mm["reason"] == "action_set_mismatch"
+    assert mm["stage"] == 1
+    assert mm["expected"] == []
+    assert mm["found"] == ["a1-add"]
+    assert body["verified_version"] == 0
+    assert body["next_stage"] == 1
 
 
 def test_malformed_envelope_is_422_not_a_conflict():

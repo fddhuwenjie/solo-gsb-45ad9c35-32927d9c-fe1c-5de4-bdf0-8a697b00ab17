@@ -1085,13 +1085,14 @@ curl -s -X POST http://another-instance:8080/execution-verifications \
   --data @execution-export.json
 ```
 
-核验方只用包内的场景与计划，从版本 0 起自行重建状态并**逐阶段**独立回放，依次
-核对：提交序列完整唯一连续（无缺失/重复/乱序/越界版本）、版本与阶段头一致、
-动作集合与原计划该阶段**完全一致**（**空阶段同样核对**）、阶段可安全回放
-（`allowed_stages`、同阶段增撤矛盾、阶段后每条通信关系仍有有效信任路径）、每条
-现场信任锚/端点链观测都与确定性推出的阶段后状态一致，以及包内快照与核验方独立
-重建的快照逐项一致（动作、观测、完整信任锚集合、完整端点链集合与**全部**通信
-关系）。发现缺失、重复、乱序或任何内容不符时，返回
+核验方只用包内的场景与计划，从版本 0 起自行重建状态并**逐版本**独立回放，每个版本
+依次核对：该版本在提交序列中的位置正确（完整唯一连续，无缺失/重复/乱序/越界版本）、
+版本与阶段头一致、动作集合与原计划该阶段**完全一致**（**空阶段同样核对**）、阶段可
+安全回放（`allowed_stages`、同阶段增撤矛盾、阶段后每条通信关系仍有有效信任路径）、
+每条现场信任锚/端点链观测都与确定性推出的阶段后状态一致，以及包内快照与核验方独立
+重建的快照逐项一致（动作、观测、完整信任锚集合、完整端点链集合与**全部**通信关系）。
+任一版本未通过即停止：较早版本的动作、观测或快照不符**优先于**更晚出现的缺失、重复
+或乱序报告。发现缺失、重复、乱序或任何内容不符时，返回
 `"status": "conflict"` 并给出**首个**出错阶段（`mismatch.stage` /
 `mismatch.version`）与机器可读 `reason`（如 `commit_gap`、
 `commit_duplicate_version`、`stage_out_of_order`、`commit_extra`、
@@ -1100,8 +1101,9 @@ curl -s -X POST http://another-instance:8080/execution-verifications \
 `observation_mismatch`、`snapshot_mismatch`、`invalid_scenario` /
 `invalid_plan`，或信任回放码 `untrusted_root` / `issuer_mismatch` /
 `action_not_allowed_at_stage` / `contradictory_actions_same_stage`），
-**不依据错误快照继续回放**（`verified_version` 为已确认版本数，之后的版本不再
-核验）。
+**不依据错误快照继续回放**，也不依据包头或尚未核对的提交推进版本
+（`verified_version` 只计入完整核验通过的版本，即最后一个核验通过的版本号，
+之后的版本不再核验）。
 
 计划**尚未执行完**时，核验通过也会明确返回「已核对到哪个版本、下一阶段是
 几」。以上面只提交了阶段 1 的包为例：
@@ -1122,14 +1124,15 @@ curl -s -X POST http://another-instance:8080/execution-verifications \
 
 计划全部提交后再导出核验，则 `"verified_version"` 为 2、`"next_stage"` 为
 `null`、`"finished"` 为 `true`。出错示例（把版本 1 提交的动作由
-`a1-add-new-root` 改成 `a3-remove-old-root`，阶段后即断链）：
+`a1-add-new-root` 改成 `a3-remove-old-root`，阶段后即断链）：版本 1 未通过
+核验，只有版本 0 计入已核验进度，下一阶段仍为 1：
 
 ```json
 {
   "status": "conflict",
-  "verified_version": 1,
+  "verified_version": 0,
   "version": 1,
-  "next_stage": 2,
+  "next_stage": 1,
   "finished": false,
   "mismatch": {
     "version": 1,
